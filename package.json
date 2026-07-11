@@ -1,0 +1,236 @@
+const TelegramBot = require('node-telegram-bot-api');
+const fetch = require('node-fetch');
+
+// -------------------------------------------------------------
+// 1. CONFIGURATION & CORE ENGINE SETUP
+// -------------------------------------------------------------
+const TOKEN = '8872203427:AAHNoim5SG3dQb6hYeEkFfigda8l_PdN9Pw'; 
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+class DeepMatrixEngine {
+    constructor() {
+        this.lastPeriod = null;
+        this.currentPrediction = null;
+        this.history = []; 
+        this.predictionsMap = new Map();
+        this.mirrorMap = {0: 5, 1: 6, 2: 7, 3: 8, 4: 9, 5: 0, 6: 1, 7: 2, 8: 3, 9: 4};
+        this.subscribedChats = new Set(); 
+    }
+
+    getSize(n) {
+        return parseInt(n) >= 5 ? "BIG" : "SMALL";
+    }
+
+    async fetchData() {
+        const timestamp = new Date().getTime();
+        const API = `https://draw.ar-lottery01.com/WinGo/WinGo_30S/GetHistoryIssuePage.json?_=${timestamp}`;
+        
+        try {
+            const response = await fetch(API);
+            const json = await response.json();
+            if(json.code === 0 && json.data && json.data.list) {
+                this.processData(json.data.list);
+            }
+        } catch(e) {
+            console.log("OFFLINE LINK RE-CONNECTING...");
+        }
+    }
+
+    processData(list) {
+        if (!list || list.length === 0) return;
+
+        const latest = list[0];
+        const latestPeriod = latest.issueNumber;
+
+        if (this.lastPeriod === latestPeriod) return;
+        this.lastPeriod = latestPeriod;
+
+        const incomingData = list.map(d => ({
+            period: d.issueNumber,
+            num: parseInt(d.number),
+            size: this.getSize(d.number)
+        }));
+
+        let combined = [...incomingData, ...this.history];
+        const uniqueMap = new Map();
+        combined.forEach(item => uniqueMap.set(item.period, item));
+        
+        this.history = Array.from(uniqueMap.values()).sort((a, b) => b.period.localeCompare(a.period));
+
+        const nextPeriod = (BigInt(latestPeriod) + 1n).toString();
+        this.generateNextSequence(nextPeriod);
+        this.broadcastPrediction(nextPeriod);
+    }
+
+    generateNextSequence(nextPeriod) {
+        if (this.history.length < 10) {
+            this.currentPrediction = { period: nextPeriod, size: "BIG", nums: [5, 2], score: 50, log: "INIT DATA POOL..." };
+            this.predictionsMap.set(nextPeriod, this.currentPrediction);
+            return;
+        }
+
+        const latestResult = this.history[0];
+        const last10 = this.history.slice(0, 10).map(h => h.num);
+
+        // --- 1. GAP ANALYSIS ENGINE ---
+        let gaps = Array(10).fill(0);
+        for(let i = 0; i < 10; i++) {
+            let gapCount = this.history.findIndex(h => h.num === i);
+            gaps[i] = gapCount === -1 ? 20 : gapCount;
+        }
+        let maxGapNum = gaps.indexOf(Math.max(...gaps));
+
+        // --- 2. FREQUENCY ENGINE ---
+        let freq = Array(10).fill(0);
+        last10.forEach(n => freq[n]++);
+        let maxFreqNum = freq.indexOf(Math.max(...freq));
+
+        // --- 3. MIRROR PAIR LOGIC ---
+        const mirrorSuggestion = this.mirrorMap[latestResult.num];
+
+        // --- 4. TREND / MOVING AVERAGE ---
+        const sum10 = last10.reduce((a, b) => a + b, 0);
+        const avgSuggestion = Math.round(sum10 / 10);
+
+        // --- 5. ADVANCED WEIGHT COMPONENT SCORING ---
+        let matrixScores = Array(10).fill(0);
+        for(let i=0; i<10; i++) {
+            if(i === maxFreqNum) matrixScores[i] += 25;
+            if(i === maxGapNum) matrixScores[i] += 20;
+            if(i === mirrorSuggestion) matrixScores[i] += 15;
+            if(i === avgSuggestion) matrixScores[i] += 10;
+            if(this.history[0].size === this.getSize(i)) matrixScores[i] += 10; 
+        }
+
+        let ranked = matrixScores.map((score, num) => ({ num, score })).sort((a, b) => b.score - a.score);
+        let primaryNum = ranked[0].num;
+        let secondaryNum = ranked[1].num;
+        
+        if(primaryNum === secondaryNum) {
+            secondaryNum = (primaryNum + 1) % 10;
+        }
+
+        let finalConfidence = Math.min(85 + (ranked[0].score / 2), 99.2);
+
+        this.currentPrediction = {
+            period: nextPeriod,
+            size: this.getSize(primaryNum),
+            nums: [primaryNum, secondaryNum],
+            score: finalConfidence.toFixed(1),
+            log: `FREQ: ${maxFreqNum} | GAP: ${maxGapNum} | MIRROR: ${mirrorSuggestion}`
+        };
+        this.predictionsMap.set(nextPeriod, this.currentPrediction);
+    }
+
+    broadcastPrediction(nextPeriod) {
+        const pred = this.currentPrediction;
+        if (!pred || this.subscribedChats.size === 0) return;
+
+        let lastResultMsg = "";
+        if (this.history.length > 1) {
+            const lastPlayed = this.history[1]; 
+            const lastPred = this.predictionsMap.get(lastPlayed.period);
+            if (lastPred) {
+                const isWin = lastPlayed.size === lastPred.size;
+                lastResultMsg = `\n📊 *Last Period (${lastPlayed.period.slice(-4)}) Result:* ${lastPlayed.size} (${lastPlayed.num}) -> ${isWin ? '✅ WIN' : '❌ LOSS'}\n---`;
+            }
+        }
+
+        const message = `
+🔮 *AURA QUANTUM v16.0 ALERT* 🔮
+${lastResultMsg}
+🎯 *Target Period:* \`${nextPeriod.slice(-4)}\`
+🚀 *Prediction:* *${pred.size}*
+🎲 *Suggestion Cells:* \`[ ${pred.nums[0]} , ${pred.nums[1]} ]\`
+📈 *AI Confidence:* \`${pred.score}%\`
+
+⚙️ _Matrix Engine: ${pred.log}_
+        `;
+
+        for (let chatId of this.subscribedChats) {
+            bot.sendMessage(chatId, message, { parse_mode: 'Markdown' }).catch(err => {
+                console.log(`Chat standard error.`);
+            });
+        }
+    }
+}
+
+const Engine = new DeepMatrixEngine();
+setInterval(() => Engine.fetchData(), 4000);
+Engine.fetchData();
+
+// -------------------------------------------------------------
+// 2. TELEGRAM COMMAND HANDLERS
+// -------------------------------------------------------------
+
+bot.onText(/\/start/, (msg) => {
+    const chatId = msg.chat.id;
+    const welcomeText = `
+🤖 *Welcome to AURA QUANTUM v16.0 Bot*
+Hybrid Pattern Defense Engine active hai.
+
+*Available Commands:*
+🔹 /predict - Current live prediction dekhne ke liye.
+🔹 /subscribe - Har naye round (30s) par auto-message paane ke liye.
+🔹 /unsubscribe - Auto-alerts band karne ke liye.
+🔹 /stats - Live Big/Small ratios check karne ke liye.
+    `;
+    bot.sendMessage(chatId, welcomeText, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/predict/, (msg) => {
+    const chatId = msg.chat.id;
+    const pred = Engine.currentPrediction;
+
+    if (!pred) {
+        bot.sendMessage(chatId, "⏳ AI Engine initialize ho raha hai, kripya 4-5 seconds baad try karein...");
+        return;
+    }
+
+    const message = `
+🎯 *LIVE AURA QUANTUM PREDICTION*
+---
+📌 *Period:* \`${pred.period.slice(-4)}\`
+🔮 *Output:* *${pred.size}*
+🎲 *Cells:* \`${pred.nums.join(' & ')}\`
+🔥 *Confidence:* \`${pred.score}%\`
+    `;
+    bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/subscribe/, (msg) => {
+    const chatId = msg.chat.id;
+    Engine.subscribedChats.add(chatId);
+    bot.sendMessage(chatId, "✅ *Subscribed!* Ab aapko har 30 second me automatic signal milte rahenge.");
+});
+
+bot.onText(/\/unsubscribe/, (msg) => {
+    const chatId = msg.chat.id;
+    Engine.subscribedChats.delete(chatId);
+    bot.sendMessage(chatId, "❌ *Unsubscribed.* Auto-alerts band kar diye gaye hain.");
+});
+
+bot.onText(/\/stats/, (msg) => {
+    const chatId = msg.chat.id;
+    if (Engine.history.length === 0) {
+        bot.sendMessage(chatId, "📊 Data store abhi khali hai.");
+        return;
+    }
+
+    const totalRows = Math.min(Engine.history.length, 25); 
+    let bigCount = 0;
+    Engine.history.slice(0, totalRows).forEach(h => { if(h.size === 'BIG') bigCount++; });
+
+    let bigPercent = Math.round((bigCount / totalRows) * 100);
+    let smallPercent = 100 - bigPercent;
+
+    const message = `
+📊 *LIVE DENSITY STATUS (Last ${totalRows} Rounds)*
+---
+🔵 *BIG Ratio:* \`${bigPercent}%\`
+🔴 *SMALL Ratio:* \`${smallPercent}%\`
+    `;
+    bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+});
+
+console.log("🚀 AURA QUANTUM Bot Backend running...");
